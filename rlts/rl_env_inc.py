@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import data_utils as F
 import copy
@@ -43,10 +44,10 @@ class TrajComp():
         self.err_seg = {}
         self.err_record = {}
         steps = len(self.ori_traj_set[episode])
-        self.F_ward = {} # save (state_value, next_point)
-        self.B_ward = {} # save (state_value, last_point)
-        self.F_ward[0] = [0.0, 1]
-        self.B_ward[1] = [0.0, 0]
+        self.F_ward = {0:[0.0,1]} # save (state_value, next_point)
+        self.B_ward = {1:[0.0,0]} # save (state_value, last_point)
+        # self.F_ward[0] = [0.0, 1]
+        # self.B_ward[1] = [0.0, 0]
         self.link_head = 0
         self.link_tail = 1
         self.sortedlist = SortedList({})
@@ -54,13 +55,16 @@ class TrajComp():
             self.read(i, episode)
         #t = heapq.nsmallest(self.n_features, self.heap)
         t = self.sortedlist[:self.n_features]
+        # print(len(t))
+        # print(self.n_features)
+        # print(t)
         if len(t) < self.n_features:
             self.check = [t[0][1],t[0][1],t[1][1]]
             self.state = [t[0][0],t[0][0],t[1][0]]
         else:
             self.check = [t[0][1], t[1][1],t[2][1]]
             self.state = [t[0][0], t[1][0],t[2][0]]
-
+        
         return steps, np.array(self.state).reshape(1, -1)           
         
     def reward_update(self, episode, rem):
@@ -176,21 +180,6 @@ class TrajComp():
             del self.end[b]
         else:
             print('Here is a bug!!!')
-    
-    def delete_heap(self, heap, nodeValue):
-        leafValue = heap[-1]
-        i = heap.index(nodeValue)
-        if nodeValue == leafValue:
-            heap.pop(-1)
-        elif nodeValue <= leafValue: # similar to heappop
-            heap[i], heap[-1] = heap[-1], heap[i]
-            minimumValue = heap.pop(-1)
-            if heap != []:
-                _siftup(heap, i)
-        else: # similar to heappush
-            heap[i], heap[-1] = heap[-1], heap[i]
-            minimumValue = heap.pop(-1)
-            _siftdown(heap, 0, i)
         
     def step(self, episode, action, index, done, label='T'):        
         # update state and compute reward
@@ -245,47 +234,105 @@ class TrajComp():
                 self.check = [t[0][1], t[1][1],t[2][1]]
                 self.state = [t[0][0], t[1][0],t[2][0]]
 
-        #cannot remove the starting and ending
-#        if self.current_left == self.link_head:
-#            self.check.append(self.current_right)
-#            self.state.append(self.B_ward[self.current_right][0])
-#        elif self.current_right == self.link_tail:
-#            self.check.append(self.current_left)
-#            self.state.append(self.F_ward[self.current_left][0])
-#        elif self.F_ward[self.current_left][0] < self.B_ward[self.current_right][0]:
-#            self.check.append(self.current_left)
-#            self.state.append(self.F_ward[self.current_left][0])
-#        else:
-#            self.check.append(self.current_right)
-#            self.state.append(self.B_ward[self.current_right][0])
-            
-        #self.state.append(self.current)        
-        #self.state[1] = self.state[1] - self.current
-        #print('check and state', self.check, self.state)
         return np.array(self.state).reshape(1, -1), rw
     
-    def output(self, episode, label = 'T'):
+    output_dir_norm = "dataset/norm_dims/sim"
+    orig_dir = "dataset/dims/"
+
+    def compute_weights(self, sim_traj):
+        values = np.array([pt[0] for pt in sim_traj], dtype=float)
+        times  = np.array([pt[1] for pt in sim_traj], dtype=float)
+        raw_w = []
+        for i in range(len(values)):
+            if i == 0:
+                dv = abs(values[1] - values[0])
+                dt = times[1] - times[0]
+            else:
+                dv = abs(values[i] - values[i-1])
+                dt = times[i] - times[i-1]
+            # 防止除以 0
+            w = dv/(dt if dt>0 else 1e-8)
+            raw_w.append(w)
+        raw_w = np.array(raw_w, dtype=float)
+
+        # z-score 标准化
+        mu, sigma = raw_w.mean(), raw_w.std(ddof=0)
+        if sigma > 0:
+            z = (raw_w - mu) / sigma
+        else:
+            z = np.zeros_like(raw_w)
+
+        # Min–Max 归一化到 [0,1]
+        zmin, zmax = z.min(), z.max()
+        if zmax > zmin:
+            norm_w = ((z - zmin) / (zmax - zmin)).tolist()
+        else:
+            norm_w = [0.0] * len(z)
+
+        return norm_w
+
+    def output(self, episode, label='T',
+            output_dir_norm="dataset/norm_dims/sim",
+            orig_dir="dataset/dims/"):
         if label == 'V-VIS':
+            # 1) 构造简化后的轨迹点列表
             start = 0
             sim_traj = []
             while start in self.F_ward:
                 sim_traj.append(self.ori_traj_set[episode][start])
                 start = self.F_ward[start][1]
             sim_traj.append(self.ori_traj_set[episode][start])
-            _, final_error = F.sed_error(self.ori_traj_set[episode], sim_traj)
-            print('Validation at episode {} with error {}'.format(episode, final_error))
-            #for visualization, 'sed' is by default, if you want to draw other errors by revising the codes in data_utils.py correspondingly.
-            F.draw(self.ori_traj_set[episode], sim_traj) 
-            return final_error
+
+            # 2) 计算误差
+            _, final_error, pct_error = F.sed_error(
+                self.ori_traj_set[episode], sim_traj)
+
+            norm_w = self.compute_weights(sim_traj)
+
+            # 4) 输出归一化简化结果
+            os.makedirs(output_dir_norm, exist_ok=True)
+            fn_norm = os.path.join(output_dir_norm, f"sim_{episode}")
+            with open(fn_norm, 'w') as f:
+                for (pt, w) in zip(sim_traj, norm_w):
+                    f.write(f"{pt[0]} {pt[1]} {w:.6f}\n")
+            print(f"Saved normalized sim to {fn_norm}")
+
+            # 5) 读取对应原始维度文件，构建 seq->原始值 映射
+            path_orig = os.path.join(orig_dir, str(episode))
+            orig_map = {}
+            with open(path_orig, 'r') as rf:
+                for line in rf:
+                    v, s = line.strip().split()
+                    orig_map[int(s)] = v
+
+            # 6) 输出未归一化的简化结果
+            output_dir_orig = os.path.join(orig_dir, "sim")
+            os.makedirs(output_dir_orig, exist_ok=True)
+            fn_orig = os.path.join(output_dir_orig, f"sim_{episode}")
+            with open(fn_orig, 'w') as f:
+                for (pt, w) in zip(sim_traj, norm_w):
+                    seq = pt[1]
+                    raw_v = orig_map[seq]
+                    f.write(f"{raw_v} {seq} {w:.6f}\n")
+            print(f"Saved raw sim to {fn_orig}")
+
+            # 7) 打印误差并可视化
+            print('Validation at episode {} with error {:.6e} (percentage {:.6e}%)'
+                .format(episode, final_error, pct_error))
+            F.draw(self.ori_traj_set[episode], sim_traj)
+
+            return final_error, pct_error
         if label == 'V':
             start = 0
             sim_traj = []
             while start in self.F_ward:
                 sim_traj.append(self.ori_traj_set[episode][start])
                 start = self.F_ward[start][1]
+                # print(sim_traj)
             sim_traj.append(self.ori_traj_set[episode][start])
-            _, final_error = F.sed_error(self.ori_traj_set[episode], sim_traj)
-            return final_error
+            # print(sim_traj)
+            _, final_error, pct_error = F.sed_error(self.ori_traj_set[episode], sim_traj)
+            return final_error,pct_error
         if label == 'T':
-            print('Training at episode {} with error {}'.format(episode, self.current))
+            print('Training at episode {} with error {:.6e}'.format(episode, self.current))
             return self.current
